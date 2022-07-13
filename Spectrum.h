@@ -166,6 +166,14 @@ namespace spectrum {
 		}
 	};
 
+	FORCE_INLINE uint64_t read_hash5(const uint8_t* const ptr) {
+		uint64_t value;
+		memcpy(&value, ptr, 8);
+		if (is_little_endian())
+			return value << 24;
+		return value >> 24;  //Assumes big endian
+	}
+
 #else  //32 bit functions
 
 	FORCE_INLINE uint32_t unsafe_int_log2(uint32_t value) {
@@ -233,6 +241,12 @@ namespace spectrum {
 			return value * 0x27d4eb2d;
 		}
 	};
+
+	FORCE_INLINE uint32_t read_hash5(const uint8_t* const ptr) {
+		uint32_t value;
+		memcpy(&value, ptr, 4);
+		return value ^ ptr[4];
+	}
 
 #endif
 
@@ -341,13 +355,9 @@ namespace spectrum {
 	//https://github.com/romeric/fastapprox/blob/master/fastapprox/src/fastlog.h
 	FORCE_INLINE float fast_log2(float x) {
 		union { float f; uint32_t i; } vx = { x };
-		union { uint32_t i; float f; } mx = { (vx.i & 0x007FFFFF) | 0x3f000000 };
 		float y = vx.i;
 		y *= 1.1920928955078125e-7f;
-
-		return y - 124.22551499f
-			- 1.498030302f * mx.f
-			- 1.72587999f / (0.3520887068f + mx.f);
+		return y - 126.94269504f;
 	}
 
 	float calculate_entropy(const uint8_t* buf, const size_t bufsize) {
@@ -402,11 +412,110 @@ namespace spectrum {
 		return entropy;
 	}
 
+	//Tries to find a match between the two locations, and returns the length
+	//Note that this function should be called with at least MIN_LENGTH + 8 bytes of buffer after limit
+	FORCE_INLINE size_t test_match(const uint8_t* front, const uint8_t* back, const uint8_t* const limit, const size_t minLength) {
+
+		//Test first bytes
+		if (!std::equal(back, back + minLength, front))
+			return 0;
+
+		const uint8_t* const matchOrigin = front;
+		front += minLength;
+		back += minLength;
+
+		if (IS_64BIT && is_little_endian()) {
+			while (true) {
+				if (unlikely(front + 8 > limit)) {
+					if (front > limit)
+						return 0;
+
+					while (*front == *back && front < limit) {
+						front++;
+						back++;
+					}
+					return front - matchOrigin;
+				}
+
+				//Compare 8 bytes at a time using xor. It has the property of returning 0 if the two values are equal.
+				//In case they differ, we can get the first byte that differs using a bit scan.
+				const uint64_t xorVal = read_uint64le(front) ^ read_uint64le(back);
+
+				if (xorVal) {
+					front += unsafe_bit_scan_forward(xorVal) >> 3;
+					return front - matchOrigin;
+				}
+
+				front += 8;
+				back += 8;
+			}
+		}
+		else {
+			if (front > limit)
+				return 0;
+			while (*front == *back && front < limit) {
+				front++;
+				back++;
+			}
+			return front - matchOrigin;
+		}
+	}
+
+	//Default "compressor" used when no backend is specified
+	size_t dummy_compressor(const uint8_t* input, const size_t size) {
+
+		if (size <= 16)
+			return size;
+
+		const uint8_t* const inputStart = input;
+		const uint8_t* const inputEnd = input + size - 15;  //Leave some buffer at the end. test_match() requires this
+		input++;
+
+		//Use 16 bit integers, this is enough for current preprocessor blocks
+		HashTable<uint16_t, FastIntHash> lzdict; 
+		lzdict.init(13);
+		uint16_t literalHist[256];
+		std::fill_n(literalHist, 256, 0);
+
+		size_t outSize = 0;
+		while (input < inputEnd) {
+			uint16_t& entry = lzdict[read_hash5(input)];
+			size_t length = test_match(input, inputStart + entry, inputEnd, 5);
+			entry = input - inputStart;
+
+			if (length) {
+				outSize += 2;  //Assume matches take ~2 bytes
+				lzdict[read_hash5(input + 1)] = input - inputStart;
+				input += length;
+			}
+			else {
+				literalHist[*input]++;
+				input++;
+			}
+		}
+
+		size_t numberLiterals = 0;
+		for (size_t i = 0; i < 256; i++)
+			numberLiterals += literalHist[i];
+
+		float entropy = 0;
+		for (size_t i = 0; i < 256; i++) {
+			if (literalHist[i]) {
+				float prob = (float)literalHist[i] / numberLiterals;
+				entropy -= prob * fast_log2(prob);
+			}
+		}
+		outSize += numberLiterals * entropy / 8;
+
+		return outSize;
+	}
+
 	const int CALL_ADDRESS = 0;
 	const int JUMP_ADDRESS = 1;
 	const int MOV_ADDRESS = 2;
 	const int LEA_ADDRESS = 3;
 
+	//Based on Igor's BCJ2 and Shelwien's x64flt3
 	size_t x86_encode(const uint8_t* input, const size_t size, uint8_t* output) {
 
 		const uint8_t* const start = input;
@@ -855,6 +964,9 @@ namespace spectrum {
 
 	size_t spectrum_encode(const uint8_t* input, const size_t size, uint8_t* output, size_t(*backendCompressor)(const uint8_t*, const size_t)) {
 
+		if (backendCompressor == nullptr)
+			backendCompressor = &dummy_compressor;
+
 		const size_t PRE_BLOCK_SIZE = 64 * 1024;
 
 		//Buffer used to store delta transform, and determine if it helps compression
@@ -1021,10 +1133,6 @@ namespace spectrum {
 			float rawEntropy = calculate_entropy(thisBlockStart, thisBlockSize);
 			delta_encode(thisBlockStart, thisBlockSize, deltaBuf, channels);
 			float deltaEntropy = calculate_entropy(deltaBuf, thisBlockSize);
-			//If we dont have the backend compressor, add a penalty for values equal to 0.
-			//These usually help, since that means repeated elements, which compressors usually handle well already.
-			if (!backendCompressor)
-				deltaEntropy += (float)std::count(deltaBuf, deltaBuf + thisBlockSize, 0) / thisBlockSize * 2.0;
 
 			if (rawEntropy - 0.5 < deltaEntropy) {
 				if (filters.back().filter == NONE_FILTER)
@@ -1036,26 +1144,21 @@ namespace spectrum {
 			}
 
 			//PRECISE CHECK: use the backend compressor and compare compressed sizes
-			size_t raw, delta;
-			if (backendCompressor != nullptr) {
-				raw = (*backendCompressor)(thisBlockStart, thisBlockSize);
-				delta = (*backendCompressor)(deltaBuf, thisBlockSize);
+			size_t raw = (*backendCompressor)(thisBlockStart, thisBlockSize);
+			size_t delta = (*backendCompressor)(deltaBuf, thisBlockSize);
 
-				if (delta + 128 + std::min(raw / 4, (size_t)1024) > raw) {
-					if (filters.back().filter == NONE_FILTER)
-						filters.back().size += thisBlockSize;
-					else
-						filters.push_back({ NONE_FILTER, 0, thisBlockSize });
-					input += thisBlockSize;
-					continue;
-				}
+			if (delta + 1024 > raw) {
+				if (filters.back().filter == NONE_FILTER)
+					filters.back().size += thisBlockSize;
+				else
+					filters.push_back({ NONE_FILTER, 0, thisBlockSize });
+				input += thisBlockSize;
+				continue;
 			}
 
 			//If delta encoding helps, try linear prediction
 			lpc_encode(thisBlockStart, thisBlockSize, deltaBuf, channels);
 			float lpcEntropy = calculate_entropy(deltaBuf, thisBlockSize);
-			if (!backendCompressor)
-				lpcEntropy += (float)std::count(deltaBuf, deltaBuf + thisBlockSize, 0) / thisBlockSize * 2.0;
 
 			if (deltaEntropy - 0.1 < lpcEntropy) {
 				if (filters.back().filter == DELTA_FILTER && filters.back().channels == channels)
@@ -1066,17 +1169,14 @@ namespace spectrum {
 				continue;
 			}
 
-			if (backendCompressor != nullptr) {
-				const size_t lpc = (*backendCompressor)(deltaBuf, thisBlockSize);
-
-				if (lpc + 128 > delta) {
-					if (filters.back().filter == DELTA_FILTER && filters.back().channels == channels)
-						filters.back().size += thisBlockSize;
-					else
-						filters.push_back({ DELTA_FILTER, channels, thisBlockSize });
-					input += thisBlockSize;
-					continue;
-				}
+			const size_t lpc = (*backendCompressor)(deltaBuf, thisBlockSize);
+			if (lpc + 512 > delta) {
+				if (filters.back().filter == DELTA_FILTER && filters.back().channels == channels)
+					filters.back().size += thisBlockSize;
+				else
+					filters.push_back({ DELTA_FILTER, channels, thisBlockSize });
+				input += thisBlockSize;
+				continue;
 			}
 
 			if (filters.back().filter == LPC_FILTER && filters.back().channels == channels)
@@ -1092,6 +1192,8 @@ namespace spectrum {
 		const uint8_t* const outputStart = output;
 
 		for (auto filter = filters.begin() + 1; filter != filters.end(); filter++) {
+
+			//printf("\n Filter %d, size %d", filter->filter, filter->size);
 
 			*output++ = filter->filter;
 			write_LEB128(output, filter->size);
