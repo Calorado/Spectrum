@@ -13,6 +13,7 @@
 
 #include <cstdint>
 #include <stdio.h> //size_t
+#include <string>
 
 namespace spectrum {
 
@@ -161,17 +162,17 @@ namespace spectrum {
 
 	struct FastIntHash {
 		//Use top bits
-		uint64_t operator()(const uint64_t value) {
+		uint64_t operator()(const uint64_t value) const {
 			return value * 0xff51afd7ed558ccd;
 		}
 	};
 
-	FORCE_INLINE uint64_t read_hash5(const uint8_t* const ptr) {
+	FORCE_INLINE uint64_t read_hash6(const uint8_t* const ptr) {
 		uint64_t value;
 		memcpy(&value, ptr, 8);
 		if (is_little_endian())
-			return value << 24;
-		return value >> 24;  //Assumes big endian
+			return value << 16;
+		return value >> 16;  //Assumes big endian
 	}
 
 #else  //32 bit functions
@@ -237,15 +238,17 @@ namespace spectrum {
 	}
 
 	struct FastIntHash {
-		uint32_t operator()(const uint32_t value) {
+		uint32_t operator()(const uint32_t value) const {
 			return value * 0x27d4eb2d;
 		}
 	};
 
-	FORCE_INLINE uint32_t read_hash5(const uint8_t* const ptr) {
-		uint32_t value;
-		memcpy(&value, ptr, 4);
-		return value ^ ptr[4];
+	FORCE_INLINE uint32_t read_hash6(const uint8_t* const ptr) {
+		uint32_t value1;
+		uint16_t value2;
+		memcpy(&value1, ptr + 0, 4);
+		memcpy(&value2, ptr + 4, 2);
+		return value1 ^ value2;
 	}
 
 #endif
@@ -472,20 +475,20 @@ namespace spectrum {
 		input++;
 
 		//Use 16 bit integers, this is enough for current preprocessor blocks
-		HashTable<uint16_t, FastIntHash> lzdict; 
-		lzdict.init(13);
-		uint16_t literalHist[256];
+		HashTable<uint32_t, FastIntHash> lzdict; 
+		lzdict.init(14);
+		uint32_t literalHist[256];
 		std::fill_n(literalHist, 256, 0);
 
 		size_t outSize = 0;
 		while (input < inputEnd) {
-			uint16_t& entry = lzdict[read_hash5(input)];
-			size_t length = test_match(input, inputStart + entry, inputEnd, 5);
+			uint32_t& entry = lzdict[read_hash6(input)];
+			size_t length = test_match(input, inputStart + entry, inputEnd, 6);
 			entry = input - inputStart;
 
 			if (length) {
-				outSize += 2;  //Assume matches take ~2 bytes
-				lzdict[read_hash5(input + 1)] = input - inputStart;
+				outSize += 2;  //Assume matches take 2 bytes
+				lzdict[read_hash6(input + 1)] = input - inputStart;
 				input += length;
 			}
 			else {
@@ -555,10 +558,10 @@ namespace spectrum {
 
 			//Perform two passes: first one is to know which addresses are repeated so that we dont have false E8 and E9.
 			//I have decided to do this in blocks. Very large ones could start getting more collisions, and thus reduce compression.
-			const size_t BLOCK_SIZE = (1 << 22);
+			const size_t BLOCK_SIZE = 1 << 20;
 			const uint8_t* nextCheckpoint = end - input < BLOCK_SIZE + BLOCK_SIZE / 4 ? end : input + BLOCK_SIZE;
-			bcjTable.reset();
 
+			bcjTable.reset();
 			for (const uint8_t* it = input; it < nextCheckpoint; ) {
 				const uint32_t opcode = read_uint16le(it);
 
@@ -967,15 +970,17 @@ namespace spectrum {
 		if (backendCompressor == nullptr)
 			backendCompressor = &dummy_compressor;
 
-		const size_t PRE_BLOCK_SIZE = 64 * 1024;
+		const size_t BLOCK_SIZE = 32768;
 
 		//Buffer used to store delta transform, and determine if it helps compression
 		uint8_t* deltaBuf = nullptr;
+		HashTable<uint32_t, FastIntHash> jumpTable;
 		std::vector<PreprocessorBlock> filters;
 		try {
-			filters.reserve(size / PRE_BLOCK_SIZE + 1);
+			filters.reserve(size / BLOCK_SIZE + 1);
 			filters.push_back({ 255, 0, 0 });
-			deltaBuf = new uint8_t[PRE_BLOCK_SIZE];
+			deltaBuf = new uint8_t[BLOCK_SIZE * 2];
+			jumpTable.init(12);
 		}
 		catch (std::bad_alloc& e) {
 			return -1;
@@ -986,7 +991,7 @@ namespace spectrum {
 
 		for (; input < inputEnd; ) {
 
-			const size_t thisBlockSize = std::min((size_t)(inputEnd - input), PRE_BLOCK_SIZE);
+			const size_t thisBlockSize = std::min((size_t)(inputEnd - input), BLOCK_SIZE);
 			//if the block is small is probably better to just use the same filter,
 			//as we could have more false positives without enough data
 			if (thisBlockSize < 4096) {
@@ -1000,81 +1005,93 @@ namespace spectrum {
 			const uint8_t* const thisBlockStart = input;
 			const uint8_t* const thisBlockEnd = input + thisBlockSize;
 
-			//x86 detection
-			size_t e8count = 0;
-			size_t duplicates = 0;
+			//  X86 DETECTION
+			if (filters.back().filter != X86_FILTER) {
+				jumpTable.reset();
+				size_t e8count = 0;
+				size_t duplicates = 0;
+				const uint8_t* lastSeenDuplicate = thisBlockStart;
 
-			HashTable<uint32_t, FastIntHash> jumpTable;
-			jumpTable.init(12);
-			const uint8_t* iterator = thisBlockStart;
-
-			const size_t niceDuplicates = 128 * thisBlockSize / PRE_BLOCK_SIZE;
-			const size_t maxE8Count = 1024 * thisBlockSize / PRE_BLOCK_SIZE;
+				const uint8_t* iterator = thisBlockStart;
 #ifdef x64
-			const uint8_t* end = thisBlockEnd - 19;
-			const __m128i e8 = _mm_set1_epi8(0xE8);
+				const uint8_t* end = inputEnd - 19;
+				const __m128i e8 = _mm_set1_epi8(0xE8);
 #else
-			const uint8_t* end = thisBlockEnd - 4;
+				const uint8_t* end = inputEnd - 4;
 #endif
-			for (; iterator < end; ) {
+				bool isX86 = false;
+				const uint8_t* x86End = thisBlockStart;
+
+				while (true) {
+
+					//End reached
+					if (iterator >= end) {
+						isX86 = duplicates > 64;
+						x86End = inputEnd;
+						break;
+					}
+					//We have analised a decent chunk
+					if (iterator - thisBlockStart >= 32768) {
+						//Too few duplicates
+						if (duplicates <= 64) {
+							isX86 = false;
+							break;
+						}
+						//Too much time without finding anything
+						if (iterator - lastSeenDuplicate >= 32768) {
+							isX86 = duplicates > 64;
+							x86End = lastSeenDuplicate;
+							break;
+						}
+					}
 
 #ifdef x64
-				__m128i bytes = _mm_loadu_si128((__m128i*)iterator);
-				bytes = _mm_cmpeq_epi8(bytes, e8);
-				const size_t mask = _mm_movemask_epi8(bytes);
+					__m128i bytes = _mm_loadu_si128((__m128i*)iterator);
+					bytes = _mm_cmpeq_epi8(bytes, e8);
+					const size_t mask = _mm_movemask_epi8(bytes);
 
-				//No byte is e8, skip forward
-				if (mask == 0) {
-					iterator += 16;
-					continue;
-				}
+					//No byte is e8, skip forward
+					if (mask == 0) {
+						iterator += 16;
+						continue;
+					}
 
-				//Go to the index of the first e8 found
-				const size_t index = unsafe_bit_scan_forward(mask);
-				iterator += index + 1;
+					//Go to the index of the first e8 found
+					const size_t index = unsafe_bit_scan_forward(mask);
+					iterator += index + 1;
 #else
-				const uint8_t opcode = *iterator++;
-				if (opcode != 0xE8)
-					continue;
+					const uint8_t opcode = *iterator++;
+					if (opcode != 0xE8)
+						continue;
 #endif
 
-				uint32_t offset;
-				memcpy(&offset, iterator, 4);
-				offset += reinterpret_cast<size_t>(iterator);
+					uint32_t offset;
+					memcpy(&offset, iterator, 4);
+					offset += reinterpret_cast<size_t>(iterator);
 
-				uint32_t* tableEntry = &jumpTable[offset];
-				duplicates += (*tableEntry != 0) & (*tableEntry == offset);
-				*tableEntry = offset;
-
-				//Either we have found a good amount of duplicates, or there are way too many unique e8
-				if (duplicates > niceDuplicates || e8count >= maxE8Count)
-					break;
-
-				iterator += 4;
-				e8count++;
-			}
-
-			//Either we found a good amount, or there is a high density of them
-			if (duplicates > niceDuplicates || (duplicates > 25 && (double)duplicates / e8count > 0.15)) {
-
-				if (filters.back().filter == X86_FILTER) {
-					filters.back().size += thisBlockSize;
-				}
-				else {
-					//Joining together x86 sectors that are close seems to improve ratio a bit, 
-					// probably from reducing how often the data changes.
-					if (filters.size() > 1 && filters.back().filter == NONE_FILTER &&
-						filters.back().size <= (1 << 19) && filters[filters.size() - 2].filter == X86_FILTER) {
-						filters[filters.size() - 2].size += filters.back().size + thisBlockSize;
-						filters.pop_back();
+					uint32_t* tableEntry = &jumpTable[offset];
+					if (*tableEntry == offset) {
+						duplicates++;
+						lastSeenDuplicate = iterator;
 					}
 					else {
-						filters.push_back({ X86_FILTER, 0, thisBlockSize });
+						*tableEntry = offset;
 					}
+
+					iterator += 4;
+					e8count++;
 				}
 
-				input += thisBlockSize;
-				continue;
+				if (isX86) {
+					size_t x86Size = x86End - thisBlockStart;
+					if (filters.back().filter == X86_FILTER)
+						filters.back().size += x86Size;
+					else
+						filters.push_back({ X86_FILTER, 0, x86Size });
+
+					input += x86Size;
+					continue;
+				}
 			}
 
 			//  DELTA DETECTION
@@ -1102,6 +1119,7 @@ namespace spectrum {
 			}
 #else
 			for (; it != thisBlockEnd; it++) {
+				distanceCount[0] += it[0] == it[-1];
 				distanceCount[1] += it[0] == it[-2];
 				distanceCount[2] += it[0] == it[-3];
 				distanceCount[3] += it[0] == it[-4];
@@ -1120,9 +1138,9 @@ namespace spectrum {
 			}
 #endif
 
-			size_t channels = 2;
-			size_t highestCount = distanceCount[1];
-			for (size_t i = 2; i <= 15; i++) {
+			size_t channels = 1;
+			size_t highestCount = distanceCount[0];
+			for (size_t i = 1; i < 16; i++) {
 				if (distanceCount[i] > highestCount) {
 					highestCount = distanceCount[i];
 					channels = i + 1;
@@ -1131,8 +1149,8 @@ namespace spectrum {
 
 			//FAST CHECK: compare entropies
 			float rawEntropy = calculate_entropy(thisBlockStart, thisBlockSize);
-			delta_encode(thisBlockStart, thisBlockSize, deltaBuf, channels);
-			float deltaEntropy = calculate_entropy(deltaBuf, thisBlockSize);
+			delta_encode(thisBlockStart, thisBlockSize, deltaBuf + BLOCK_SIZE, channels);
+			float deltaEntropy = calculate_entropy(deltaBuf + BLOCK_SIZE, thisBlockSize);
 
 			if (rawEntropy - 0.5 < deltaEntropy) {
 				if (filters.back().filter == NONE_FILTER)
@@ -1144,10 +1162,21 @@ namespace spectrum {
 			}
 
 			//PRECISE CHECK: use the backend compressor and compare compressed sizes
-			size_t raw = (*backendCompressor)(thisBlockStart, thisBlockSize);
-			size_t delta = (*backendCompressor)(deltaBuf, thisBlockSize);
+			//To improve results, also the last block will be used, if available
+			if (thisBlockStart - inputStart >= BLOCK_SIZE) {
+				if (filters.back().filter == DELTA_FILTER)
+					delta_encode(thisBlockStart - BLOCK_SIZE, BLOCK_SIZE, deltaBuf, filters.back().channels);
+				else if (filters.back().filter == LPC_FILTER)
+					lpc_encode(thisBlockStart - BLOCK_SIZE, BLOCK_SIZE, deltaBuf, filters.back().channels);
+				else
+					memcpy(deltaBuf, thisBlockStart - BLOCK_SIZE, BLOCK_SIZE);
+			}
 
-			if (delta + 1024 > raw) {
+			size_t delta = (*backendCompressor)(deltaBuf, BLOCK_SIZE + thisBlockSize);
+			memcpy(deltaBuf + BLOCK_SIZE, thisBlockStart, thisBlockSize);
+			size_t raw = (*backendCompressor)(deltaBuf, BLOCK_SIZE + thisBlockSize);
+
+			if (delta + 768 > raw) {
 				if (filters.back().filter == NONE_FILTER)
 					filters.back().size += thisBlockSize;
 				else
@@ -1157,8 +1186,8 @@ namespace spectrum {
 			}
 
 			//If delta encoding helps, try linear prediction
-			lpc_encode(thisBlockStart, thisBlockSize, deltaBuf, channels);
-			float lpcEntropy = calculate_entropy(deltaBuf, thisBlockSize);
+			lpc_encode(thisBlockStart, thisBlockSize, deltaBuf + BLOCK_SIZE, channels);
+			float lpcEntropy = calculate_entropy(deltaBuf + BLOCK_SIZE, thisBlockSize);
 
 			if (deltaEntropy - 0.1 < lpcEntropy) {
 				if (filters.back().filter == DELTA_FILTER && filters.back().channels == channels)
@@ -1169,8 +1198,8 @@ namespace spectrum {
 				continue;
 			}
 
-			const size_t lpc = (*backendCompressor)(deltaBuf, thisBlockSize);
-			if (lpc + 512 > delta) {
+			size_t lpc = (*backendCompressor)(deltaBuf, BLOCK_SIZE + thisBlockSize);
+			if (lpc + 384 > delta) {
 				if (filters.back().filter == DELTA_FILTER && filters.back().channels == channels)
 					filters.back().size += thisBlockSize;
 				else
