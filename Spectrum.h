@@ -17,13 +17,22 @@
 
 namespace spectrum {
 
+	struct EncoderOptions {
+		//Used to determine whether a filter helps. Should return an estimated compressed size. 
+		//If not specified it will used a default compressor.
+		size_t(*backendCompressor)(const uint8_t*, const size_t) = nullptr;
+		//Size of the division to test delta filters
+		size_t blockSize = 65536;
+		//Number of previous bytes used to determine when a filter helps
+		size_t contextSize = 0;
+		//Size of compressed block with delta filter must be at least this number of bytes
+		// smaller than the compressed version without delta filter.
+		size_t deltaThreshold = 384;
+		//Equivalent of deltaThreshold for lpc filter
+		size_t lpcThreshold = 192;
+	};
 	//Encodes "size" bytes of data present in "input", and stores it in "output".
-	//backendCompressor is a pointer to a function that compresses data with the 
-	// backend algorithm that will be used. This is for checking whether 
-	// some filters help or not. By default it uses a fast heuristic.
-	//Returns the size of the encoded stream or -1 on failure.
-	size_t encode(const uint8_t* input, const size_t size, uint8_t* output,
-		size_t(*backendCompressor)(const uint8_t*, const size_t) = nullptr);
+	size_t encode(const uint8_t* input, const size_t size, uint8_t* output, EncoderOptions options = EncoderOptions());
 	//Decodes contents in "encoded" to "decoded".
 	//Returns 0 on success or -1 on failure or corrupted data.
 	int decode(const uint8_t* encoded, const size_t encodedSize, uint8_t* decoded, const size_t decodedSize);
@@ -965,12 +974,10 @@ namespace spectrum {
 		size_t size;
 	};
 
-	size_t encode(const uint8_t* input, const size_t size, uint8_t* output, size_t(*backendCompressor)(const uint8_t*, const size_t)) {
+	size_t encode(const uint8_t* input, const size_t size, uint8_t* output, EncoderOptions options) {
 
-		if (backendCompressor == nullptr)
-			backendCompressor = &dummy_compressor;
-
-		const size_t BLOCK_SIZE = 16384;
+		if (options.backendCompressor == nullptr)
+			options.backendCompressor = &dummy_compressor;
 
 		//Buffer used to store delta transform, and determine if it helps compression
 		uint8_t* deltaBuf = nullptr;
@@ -978,10 +985,10 @@ namespace spectrum {
 		HashTable<uint32_t, FastIntHash> jumpTable;
 		std::vector<PreprocessorBlock> filters;
 		try {
-			filters.reserve(size / BLOCK_SIZE + 1);
+			filters.reserve(size / options.blockSize + 1);
 			filters.push_back({ 255, 0, 0 });
-			deltaBuf = new uint8_t[BLOCK_SIZE];
-			lpcBuf = new uint8_t[BLOCK_SIZE];
+			deltaBuf = new uint8_t[options.blockSize];
+			lpcBuf = new uint8_t[options.blockSize];
 			jumpTable.init(12);
 		}
 		catch (std::bad_alloc& e) {
@@ -997,7 +1004,7 @@ namespace spectrum {
 
 		for (; input < inputEnd; ) {
 
-			const size_t thisBlockSize = std::min((size_t)(inputEnd - input), BLOCK_SIZE);
+			const size_t thisBlockSize = std::min((size_t)(inputEnd - input), options.blockSize);
 			//If the block is small is probably better to just use the same filter,
 			// as we could have more false positives without enough data
 			if (thisBlockSize < 4096) {
@@ -1102,23 +1109,23 @@ namespace spectrum {
 			}
 
 			//  DELTA DETECTION			
-			uint32_t distanceCount[17];
-			std::fill_n(distanceCount, 17, 0);
+			uint32_t distanceCount[18];
+			std::fill_n(distanceCount, 18, 0);
 			const uint8_t* lastSeen[256];
 			std::fill_n(lastSeen, 256, thisBlockStart);
 
 			for (const uint8_t* it = thisBlockStart + 1; it < thisBlockEnd; it++) {
 				uint8_t c = *it;
-				distanceCount[std::min((size_t)(it - lastSeen[c] - 1), (size_t)16)]++;
+				distanceCount[std::min((size_t)(it - lastSeen[c]), (size_t)17)]++;
 				lastSeen[c] = it;
 			}
 
 			size_t channels = 1;
-			size_t highestCount = distanceCount[0];
-			for (size_t i = 1; i < 16; i++) {
+			size_t highestCount = distanceCount[1];
+			for (size_t i = 1; i <= 16; i++) {
 				if (distanceCount[i] > highestCount) {
 					highestCount = distanceCount[i];
-					channels = i + 1;
+					channels = i;
 				}
 			}
 
@@ -1140,14 +1147,13 @@ namespace spectrum {
 
 			//PRECISE CHECK: use the backend compressor and compare compressed sizes
 			//To improve results, also the last blocks will be used, if available
-			size_t compressorPos = filteredDataPos < BLOCK_SIZE * 3 ? 0 : filteredDataPos - BLOCK_SIZE * 3;
+			size_t compressorPos = filteredDataPos < options.contextSize ? 0 : filteredDataPos - options.contextSize;
 			memcpy(filteredDataBuffer + filteredDataPos, input, thisBlockSize);
-			size_t raw = (*backendCompressor)(filteredDataBuffer + compressorPos, filteredDataPos - compressorPos + thisBlockSize);
+			size_t raw = (*options.backendCompressor)(filteredDataBuffer + compressorPos, filteredDataPos - compressorPos + thisBlockSize);
 			memcpy(filteredDataBuffer + filteredDataPos, deltaBuf, thisBlockSize);
-			size_t delta = (*backendCompressor)(filteredDataBuffer + compressorPos, filteredDataPos - compressorPos + thisBlockSize);
+			size_t delta = (*options.backendCompressor)(filteredDataBuffer + compressorPos, filteredDataPos - compressorPos + thisBlockSize);
 
-			const size_t deltaThreshold = 384;
-			if (delta + deltaThreshold > raw) {
+			if (delta + options.deltaThreshold > raw) {
 				if (filters.back().filter == NONE_FILTER)
 					filters.back().size += thisBlockSize;
 				else
@@ -1174,9 +1180,8 @@ namespace spectrum {
 			}
 
 			memcpy(filteredDataBuffer + filteredDataPos, lpcBuf, thisBlockSize);
-			size_t lpc = (*backendCompressor)(filteredDataBuffer + compressorPos, filteredDataPos - compressorPos + thisBlockSize);
-			const size_t lpcThreshold = 192;
-			if (lpc + lpcThreshold > delta) {
+			size_t lpc = (*options.backendCompressor)(filteredDataBuffer + compressorPos, filteredDataPos - compressorPos + thisBlockSize);
+			if (lpc + options.lpcThreshold > delta) {
 				if (filters.back().filter == DELTA_FILTER && filters.back().channels == channels)
 					filters.back().size += thisBlockSize;
 				else
