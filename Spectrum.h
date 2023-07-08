@@ -556,9 +556,9 @@ namespace spectrum {
 		}
 	};
 
-	const uint32_t RANS_BIT_PRECISION = 31;
+	const uint32_t RANS_BIT_PRECISION = 32;
 	const uint32_t RANS_NORMALIZATION_INTERVAL = (1 << (RANS_BIT_PRECISION - 16));
-	const uint32_t RANS_FLUSH_PERIOD = 16384;
+	const uint32_t RANS_FLUSH_PERIOD = 32768;
 
 	//simple 32bit single state rans
 	class RansEncoder {
@@ -1478,7 +1478,7 @@ namespace spectrum {
 			}
 			
 			if (failedCheck) {
-				if (filters.back() == lpcO1Filter)
+				if (filters.back().operator==(lpcO1Filter))
 					filters.back().size += thisBlockSize;
 				else
 					filters.push_back(lpcO1Filter);
@@ -1503,7 +1503,7 @@ namespace spectrum {
 			}
 
 			if (failedCheck) {
-				if (filters.back() == lpcO2Filter)
+				if (filters.back().operator==(lpcO2Filter))
 					filters.back().size += thisBlockSize;
 				else
 					filters.push_back(lpcO2Filter);
@@ -1513,7 +1513,7 @@ namespace spectrum {
 				continue;
 			}
 
-			if (filters.back() == lpcO3Filter)
+			if (filters.back().operator==(lpcO3Filter))
 				filters.back().size += thisBlockSize;
 			else
 				filters.push_back(lpcO3Filter);
